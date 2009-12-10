@@ -1,0 +1,496 @@
+﻿<#@ include file="Settings.ttinclude" #>
+<#@ import namespace="Oracle.DataAccess.Client" #>
+<#@ import namespace="Oracle.DataAccess.Types" #>
+<#+
+IDataReader GetReader(string sql){
+    OracleConnection conn=new OracleConnection(ConnectionString);
+    OracleCommand cmd=new OracleCommand(sql,conn);
+    conn.Open();
+    return cmd.ExecuteReader(CommandBehavior.CloseConnection);
+}
+OracleCommand GetCommand(string sql){
+    OracleConnection conn=new OracleConnection(ConnectionString);
+    OracleCommand cmd=new OracleCommand(sql,conn);
+    conn.Open();
+    return cmd;
+}
+
+string FKSql = @"SELECT
+		cons.table_name as ThisTable,
+		cols2.column_name as ThisColumn,
+		cols.table_name as OtherTable,
+		cols.column_name as OtherColumn,
+		cons.CONSTRAINT_NAME as Constraint_Name,
+		cons.OWNER as Owner,
+		cons.R_CONSTRAINT_NAME as OtherConstraint,
+		cons.CONSTRAINT_TYPE as ConstraintType
+	FROM all_constraints cons
+	INNER JOIN ALL_CONS_COLUMNS cols ON cons.R_CONSTRAINT_NAME = cols.CONSTRAINT_NAME
+	INNER JOIN all_cons_columns cols2 ON cons.table_name = cols2.table_name AND (cols2.constraint_name = cons.constraint_name)
+	WHERE cols.owner = '" + SCHEMA_OWNER + @"' AND cols2.position IS NOT NULL
+	AND cons.table_name = '{0}' OR cols.table_name= '{0}'
+	ORDER BY 1, 2"; //tableName
+
+const string TABLE_SQL=@"SELECT
+		usr.TABLESPACE_NAME as TABLE_CATALOG,
+		cat.owner as TABLE_SCHEMA,
+		usr.TABLE_NAME,
+		cat.table_type as TABLE_Type
+	FROM all_tables usr,
+         ALL_CATALOG cat 
+    where usr.TABLE_NAME = cat.TABLE_NAME
+	and cat.table_type = 'TABLE'
+	and cat.owner = '" + SCHEMA_OWNER + @"'
+	ORDER BY usr.TABLE_NAME"; //and usr.TABLE_NAME = 'TBL_ORDERS'
+
+const string COLUMN_SQL=@"SELECT
+		usr.tablespace_name as Database,
+		tab.Owner as Owner,
+		tab.table_name as TableName,
+		tab.column_name as ColumnName,
+		tab.column_id as OrdinalPosition,
+		tab.data_default as DefaultSetting,
+		tab.nullable as IsNullable,
+		tab.data_type as DataType,
+		tab.data_precision as DataPrecision,
+		tab.data_scale as DataScale,
+		tab.data_length as MaxLength,
+		tab.data_length as DatePrecision,
+		(CASE WHEN cols.CONSTRAINT_NAME IS NULL THEN 0 ELSE 1 END) as IsIdentity,
+		0 as IsComputed FROM ALL_TAB_COLUMNS tab
+	INNER JOIN all_tables usr ON tab.TABLE_NAME = usr.TABLE_NAME
+	LEFT OUTER JOIN all_cons_columns cols ON (usr.TABLE_NAME = cols.TABLE_NAME AND tab.COLUMN_NAME = cols.COLUMN_NAME AND cols.constraint_name LIKE 'PK_%')
+	WHERE tab.owner = '" + SCHEMA_OWNER + @"'
+	AND tab.table_name = :tableName
+	ORDER BY TableName, OrdinalPosition ASC";
+  
+  string SPparams = @"SELECT * FROM ALL_ARGUMENTS WHERE OWNER = '{0}' AND OBJECT_NAME = '{1}' ORDER BY position";
+  
+  const string SP_SQL = "SELECT * FROM USER_PROCEDURES WHERE OBJECT_TYPE = 'PROCEDURE'";
+  
+
+  
+List<SPParam> GetSPParams(string spName)
+{
+    var result=new List<SPParam>();
+    string sql = string.Format(SPparams, TableSpaceName, spName);
+    int? dataprecision; int? datascale;
+    
+    //pull the tables in a reader
+    using(IDataReader rdr=GetReader(sql))
+    {
+        while(rdr.Read())
+        {
+			SPParam p=new SPParam();
+            dataprecision = null;	datascale = null;
+            
+            if(rdr["DATA_PRECISION"].GetType().Name != "DBNull")
+				dataprecision = Convert.ToInt16(rdr["DATA_PRECISION"] );
+            if(rdr["DATA_SCALE"].GetType().Name != "DBNull")
+				datascale = Convert.ToInt16(rdr["DATA_SCALE"]);
+
+			p.SysType=GetSysType(rdr["DATA_TYPE"].ToString(), dataprecision, datascale);
+			p.DbType=GetDbType(rdr["DATA_TYPE"].ToString(), dataprecision, datascale).ToString();
+			
+			//Input, Output, InputOutput, ReturnValue
+			switch (rdr["IN_OUT"].ToString().ToLower())
+			{
+				case "out":
+					//p.Direction = "Output";
+					break;
+				case "in/out":
+					//p.Direction = "InputOutput";
+					break;
+				case "return":
+					//p.Direction = "ReturnValue";
+					break;
+				default:
+					//p.Direction = "Input";
+					break;
+			}
+
+			p.Name=rdr["ARGUMENT_NAME"].ToString().Replace("@","");
+			p.CleanName=CleanUp(p.Name);
+			result.Add(p);
+        }
+    }
+	return result;
+}
+
+//    List<SPParam> GetSPParams(string spName){
+//    var result=new List<SPParam>();
+//    string[] restrictions = new string[4] { DatabaseName, null, spName, null };
+//    using(OracleConnection conn=new OracleConnection(ConnectionString)){
+//        conn.Open();
+//        var sprocs=conn.GetSchema("ProcedureParameters", restrictions);
+//        conn.Close();
+//        foreach(DataRow row in sprocs.Select("", "ORDINAL_POSITION")){
+//            SPParam p=new SPParam();
+//            p.SysType=GetSysType(row["DATA_TYPE"].ToString());
+//            p.DbType=GetDbType(row["DATA_TYPE"].ToString()).ToString();
+//            p.Name=row["PARAMETER_NAME"].ToString().Replace("@","");
+//            p.CleanName=CleanUp(p.Name);
+//            result.Add(p);
+//        }	
+//    }
+//    return result;
+//}
+
+List<SP> GetSPs()
+{
+    var result=new List<SP>();
+    //pull the sprocs in a reader
+    using(IDataReader rdr=GetReader(SP_SQL))
+    {
+        while(rdr.Read())
+        {
+			var sp=new SP();
+			sp.Name=rdr["OBJECT_NAME"].ToString();
+			if(!string.IsNullOrEmpty(sp.Name))
+				{
+				sp.CleanName=CleanUp(sp.Name);
+				sp.Parameters=GetSPParams(sp.Name);
+				result.Add(sp);
+				}
+        }
+    }
+    return result;
+}
+
+   
+   
+List<Table> LoadTables(){
+    var result=new List<Table>();
+       
+    //pull the tables in a reader
+    using(IDataReader rdr=GetReader(TABLE_SQL)){
+        while(rdr.Read()){
+            Table tbl=new Table();
+            tbl.Name=rdr["TABLE_NAME"].ToString();
+            tbl.Schema=rdr["TABLE_SCHEMA"].ToString();
+            tbl.Columns=LoadColumns(tbl);
+            tbl.PrimaryKey=GetPK(tbl.Name);
+            tbl.CleanName=CleanUp(tbl.Name);
+            tbl.ClassName=Inflector.MakeSingular(tbl.CleanName);
+            tbl.QueryableName=Inflector.MakePlural(tbl.ClassName);
+            
+            //set the PK for the columns
+            var pkColumn=tbl.Columns.SingleOrDefault(x=>x.Name.ToLower().Trim()==tbl.PrimaryKey.ToLower().Trim());
+            if(pkColumn!=null)
+                pkColumn.IsPK=true;
+            
+            tbl.FKTables=LoadFKTables(tbl.Name);
+            
+            result.Add(tbl);
+        }
+    }
+    
+    foreach(Table tbl in result){
+        //loop the FK tables and see if there's a match for our FK columns
+        foreach(Column col in tbl.Columns){
+            col.IsForeignKey=tbl.FKTables.Any(
+                x=>x.ThisColumn.Equals(col.Name,StringComparison.InvariantCultureIgnoreCase)
+            );
+        }
+    }
+    return result;
+}
+
+List<Column> LoadColumns(Table tbl){
+    var result=new List<Column>();
+    int? dataprecision; int? datascale;
+    var cmd=GetCommand(COLUMN_SQL);
+    cmd.Parameters.Add("tableName",tbl.Name);
+    using(OracleDataReader rdr=cmd.ExecuteReader(CommandBehavior.CloseConnection)){
+        while(rdr.Read()){
+            Column col=new Column();
+            dataprecision = null;	datascale = null;
+            col.Name=rdr["ColumnName"].ToString();
+            col.CleanName=CleanUp(col.Name);
+            col.DataType=rdr["DataType"].ToString();
+            if(rdr["DataPrecision"].GetType().Name != "DBNull")
+				dataprecision = Convert.ToInt16(rdr["DataPrecision"] );
+            if(rdr["DataScale"].GetType().Name != "DBNull")
+				datascale = Convert.ToInt16(rdr["DataScale"]);
+			col.SysType=GetSysType(col.DataType, dataprecision, datascale);
+            col.DbType=GetDbType(col.DataType, dataprecision, datascale);
+            col.AutoIncrement=rdr["IsIdentity"].ToString()=="1";
+            col.IsNullable=((rdr["IsNullable"].ToString()=="YES")||(rdr["IsNullable"].ToString()=="Y"));
+            int.TryParse(rdr["MaxLength"].ToString(),out col.MaxLength);
+            result.Add(col);
+        }
+    }
+     return result;
+}
+
+//    List<Column> LoadColumns(Table tbl){
+//    var result=new List<Column>();
+//    var cmd=GetCommand(COLUMN_SQL);
+//    cmd.Parameters.AddWithValue("tableName",tbl.Name);
+
+//    using(IDataReader rdr=cmd.ExecuteReader(CommandBehavior.CloseConnection)){
+//        while(rdr.Read()){
+//            Column col=new Column();
+//            col.Name=rdr["ColumnName"].ToString();
+//            col.CleanName=CleanUp(col.Name);
+//            col.DataType=rdr["DataType"].ToString();
+//            col.SysType=GetSysType(col.DataType);
+//            col.DbType=GetDbType(col.DataType);
+//            //col.Name = col.DataType.ToString();
+//            col.AutoIncrement=rdr["IsIdentity"].ToString()=="1";
+//            col.IsNullable=rdr["IsNullable"].ToString()=="Y";
+//            int.TryParse(rdr["MaxLength"].ToString(),out col.MaxLength);
+//            result.Add(col);
+//        }
+//    }
+//    return result;
+//}
+
+
+List<FKTable> LoadFKTables(string tableName)
+{
+    //this is a "bi-directional" scheme which pulls both 1-many and many-1
+    var result=new List<FKTable>();
+    string sql = string.Format(FKSql, tableName);
+    var cmd=GetCommand(sql);
+	cmd.Parameters.Add("tableName",tableName);
+    using(IDataReader rdr=cmd.ExecuteReader(CommandBehavior.CloseConnection)){
+        while(rdr.Read()){
+            FKTable fk=new FKTable();
+            string thisTable=rdr["ThisTable"].ToString();
+            
+            if(tableName.ToLower()==thisTable.ToLower())
+            {
+                fk.ThisTable=rdr["ThisTable"].ToString();
+                fk.ThisColumn=rdr["ThisColumn"].ToString();
+                fk.OtherTable=rdr["OtherTable"].ToString();
+                fk.OtherColumn=rdr["OtherColumn"].ToString();
+            }else{
+                fk.ThisTable=rdr["OtherTable"].ToString();
+                fk.ThisColumn=rdr["OtherColumn"].ToString();
+                fk.OtherTable=rdr["ThisTable"].ToString();
+                fk.OtherColumn=rdr["ThisColumn"].ToString();
+            }
+            fk.OtherClass=Inflector.MakeSingular(CleanUp(fk.OtherTable));
+            fk.OtherQueryable=Inflector.MakePlural(fk.OtherClass);
+            result.Add(fk);
+        }
+    }
+    return result;
+}
+
+
+string GetPK(string table)
+{
+	string pk="";
+	DataTable pkTable=new DataTable();
+    string sql=@"SELECT column_name FROM ALL_CONS_COLUMNS A JOIN ALL_CONSTRAINTS C  ON A.CONSTRAINT_NAME = C.CONSTRAINT_NAME WHERE C.TABLE_NAME = :tableName AND C.CONSTRAINT_TYPE = 'P'";
+	//string PKSql = @"SELECT column_name FROM all_cons_columns WHERE OWNER = '{0}' AND table_name = '{1}' AND constraint_name LIKE 'PK_%'";
+
+    var cmd=GetCommand(sql);
+    cmd.Parameters.Add("tableName",table);
+	string result = null;
+	using(IDataReader rdr=cmd.ExecuteReader(CommandBehavior.CloseConnection)){
+        while(rdr.Read()){
+			result = rdr["column_name"].ToString();
+		}
+	}
+    cmd.Dispose();
+    if(result!=null)
+        pk=result.ToString();    
+         
+	return pk;
+}
+
+    string GetSysType(string sqlType)
+    {
+        return GetSysType(sqlType, null, null);
+    }
+    string GetSysType(string sqlType, int sqlDataPrecision)
+    {
+        return GetSysType(sqlType, sqlDataPrecision, null);
+    }
+    string GetSysType(string sqlType, int? sqlDataPrecision, int? sqlDataScale)
+    {
+        string sysType = "string";
+        switch (sqlType)
+        {	 
+            case "BIGINT":
+                sysType = "long";
+                break;
+            case "SMALLINT":
+                sysType = "short";
+                break;
+			case "PLS_INTEGER":
+            case "INTEGER":    
+            case "INT":
+                sysType = "int";
+                break;
+            case "UNIQUEIDENTIFIER":
+                sysType = "Guid";
+                break;
+            case "DATE":
+            case "DATETIME":
+                sysType = "DateTime";
+                break;
+            case "FLOAT":
+                sysType = "decimal";
+                break;
+            case "NUMBER":
+                if ((!sqlDataPrecision.HasValue && !sqlDataScale.HasValue) || (sqlDataScale.HasValue && sqlDataScale.Value > 0))
+                    sysType = "decimal";
+                else
+					if (!sqlDataScale.HasValue || sqlDataScale.Value < 1)
+					{
+						sysType = "int"; //between 4 and 18
+						if(!sqlDataPrecision.HasValue)
+							sysType = "short";
+						else
+						{
+							if (sqlDataPrecision.Value < 4)
+								sysType = "short";
+							else
+							if (sqlDataPrecision.Value > 18)
+								sysType = "long";
+						}
+					}
+                break;
+            case "REAL":
+            case "NUMERIC":
+            case "SMALLMONEY":
+            case "DECIMAL":
+            case "MONEY":
+                sysType = "DECIMAL";
+                break;
+            case "BIT":
+                sysType = "bool";
+                break;
+			case "BFILE":
+			case "BLOB":
+			case "CLOB":
+            case "IMAGE":
+            case "NCLOB":
+			case "NLOB":
+			case "TIMESTAMP":
+            case "VARBINARY":
+                sysType = "byte[]";
+                break;
+        }
+        return sysType;
+    }
+    
+    System.Data.DbType GetDbType(string sqlType)
+    {
+        return GetDbType(sqlType, null, null);
+    }
+    System.Data.DbType GetDbType(string sqlType, int sqlDataPrecision)
+    {
+        return GetDbType(sqlType, sqlDataPrecision, null);
+    }
+    System.Data.DbType GetDbType(string sqlType, int? sqlDataPrecision, int? sqlDataScale)
+    {
+		System.Data.DbType DbType = System.Data.DbType.AnsiString; //Default
+        switch (sqlType)
+        {
+            case "VARCHAR2":
+            case "VARCHAR":
+            case "LONG":
+                DbType = System.Data.DbType.AnsiString;
+                break;
+            case "NVARCHAR2":
+            case "NVARCHAR":
+                DbType = System.Data.DbType.String;
+                break;
+            case "PLS_INTEGER":
+            case "INT":
+                DbType = System.Data.DbType.Int32;
+                break;
+            case "UNIQUEIDENTIFIER":
+                DbType = System.Data.DbType.Guid;
+                break;
+            case "DATETIME":
+            case "DATE":
+                DbType = System.Data.DbType.DateTime;
+                break;
+            case "BIGINT":
+                DbType = System.Data.DbType.Int64;
+                break;
+            case "BINARY":
+                DbType = System.Data.DbType.Binary;
+                break;
+            case "BIT":
+                DbType = System.Data.DbType.Boolean;
+                break;
+            case "CHAR":
+                DbType = System.Data.DbType.AnsiStringFixedLength;
+                break;
+            case "FLOAT":
+            case "DECIMAL":
+                DbType = System.Data.DbType.Decimal;
+                break;
+			case "BFILE":
+			case "BLOB":
+			case "CLOB":
+            case "IMAGE":
+            case "NCLOB":
+			case "NLOB":
+			case "TIMESTAMP":
+            case "VARBINARY":
+                DbType = System.Data.DbType.Binary;
+                break;
+            case "MONEY":
+                DbType = System.Data.DbType.Currency;
+                break;
+            case "NCHAR":
+                DbType = System.Data.DbType.String;
+                break;
+            case "NUMBER":
+                if ((!sqlDataPrecision.HasValue && !sqlDataScale.HasValue) || (sqlDataScale.HasValue && sqlDataScale.Value > 0))
+                    DbType = System.Data.DbType.Decimal;
+                else
+					if (!sqlDataScale.HasValue || sqlDataScale.Value < 1)
+					{
+						DbType = System.Data.DbType.Int32;//default:  between 4 and 18
+						if(sqlDataPrecision.HasValue)
+						{
+							if (sqlDataPrecision.Value == 1)
+								DbType = System.Data.DbType.Byte;
+							else
+							if (sqlDataPrecision.Value > 1 && sqlDataPrecision.Value < 4) //2 or 3
+								DbType = System.Data.DbType.Int16; //sysType = "short";
+							else
+							if (sqlDataPrecision.Value > 18)
+								DbType = System.Data.DbType.Int64; //sysType = "long";
+						}
+						else
+						{
+							DbType = System.Data.DbType.Int64; //sysType = "long";
+						}
+					}
+                break;
+            case "NTEXT":
+                DbType = System.Data.DbType.String;
+                break;
+            case "NUMERIC":
+                DbType = System.Data.DbType.Decimal;
+                break;
+            case "REAL":
+                DbType = System.Data.DbType.Single;
+                break;
+            case "SYSNAME":
+                DbType = System.Data.DbType.String;
+                break;
+            case "TEXT":
+                DbType = System.Data.DbType.AnsiString;
+                break;
+            case "TINYINT":
+                DbType = System.Data.DbType.Byte;
+                break;
+            case "XMLTYPE":
+            case "XML":
+                DbType = System.Data.DbType.Xml;
+                break;
+        }
+        return DbType;
+    }
+#>
