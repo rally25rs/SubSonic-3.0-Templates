@@ -1,0 +1,287 @@
+﻿<#@ include file="Settings.ttinclude" #>
+<#+
+
+IDataReader GetReader(string sql){
+    OracleConnection conn=new OracleConnection(ConnectionString);
+    OracleCommand cmd=new OracleCommand(sql,conn);
+    conn.Open();
+    return cmd.ExecuteReader(CommandBehavior.CloseConnection);
+}
+OracleCommand GetCommand(string sql){
+    OracleConnection conn=new OracleConnection(ConnectionString);
+    OracleCommand cmd=new OracleCommand(sql,conn);
+    conn.Open();
+    return cmd;
+}
+
+const string FKSql = @"SELECT
+		cons.table_name as ThisTable,
+		cols2.column_name as ThisColumn,
+		cols.table_name as OtherTable,
+		cols.column_name as OtherColumn,
+		cons.CONSTRAINT_NAME as Constraint_Name,
+		cons.OWNER as Owner,
+		cons.R_CONSTRAINT_NAME as OtherConstraint,
+		cons.CONSTRAINT_TYPE as ConstraintType
+	FROM all_constraints cons
+	INNER JOIN ALL_CONS_COLUMNS cols ON cons.R_CONSTRAINT_NAME = cols.CONSTRAINT_NAME
+	INNER JOIN all_cons_columns cols2 ON cons.table_name = cols2.table_name AND (cols2.constraint_name = cons.constraint_name)
+	WHERE cols.owner = '" + TableSpaceName + @"' AND cols2.position IS NOT NULL
+	AND cons.table_name = :tableName OR cols.table_name=:tableName
+	ORDER BY 1, 2";
+
+const string TABLE_SQL=@"SELECT
+		usr.TABLESPACE_NAME as TABLE_CATALOG,
+		cat.owner as TABLE_SCHEMA,
+		usr.TABLE_NAME,
+		cat.table_type as TABLE_Type
+	FROM all_tables usr,
+         ALL_CATALOG cat 
+    where usr.TABLE_NAME = cat.TABLE_NAME
+	and cat.table_type = 'TABLE'
+	and usr.tablespace_name <> 'SYSTEM' 
+    and usr.tablespace_name <> 'DRSYS'
+	ORDER BY usr.TABLE_NAME";
+
+const string COLUMN_SQL=@"SELECT
+		usr.tablespace_name as Database,
+		tab.Owner as Owner,
+		tab.table_name as TableName,
+		tab.column_name as ColumnName,
+		tab.column_id as OrdinalPosition,
+		tab.data_default as DefaultSetting,
+		tab.nullable as IsNullable,
+		tab.data_type as DataType,
+		tab.data_length as MaxLength,
+		tab.data_length as DatePrecision,
+		(CASE WHEN cols.CONSTRAINT_NAME IS NULL THEN 0 ELSE 1 END) as IsIdentity,
+		0 as IsComputed 
+	FROM ALL_TAB_COLUMNS tab
+	INNER JOIN all_tables usr ON tab.TABLE_NAME = usr.TABLE_NAME
+	LEFT OUTER JOIN all_cons_columns cols ON (usr.TABLE_NAME = cols.TABLE_NAME AND tab.COLUMN_NAME = cols.COLUMN_NAME AND cols.constraint_name LIKE 'PK_%')
+	WHERE tab.owner = '" + TableSpaceName + @"'
+	AND tab.table_name = :tableName
+	ORDER BY TableName, OrdinalPosition ASC";
+  
+  
+List<SPParam> GetSPParams(string spName){
+    var result=new List<SPParam>();
+    string[] restrictions = new string[4] { DatabaseName, null, spName, null };
+    using(OracleConnection conn=new OracleConnection(ConnectionString)){
+        conn.Open();
+		var sprocs=conn.GetSchema("ProcedureParameters", restrictions);
+		conn.Close();
+	    foreach(DataRow row in sprocs.Select("", "ORDINAL_POSITION")){
+		    SPParam p=new SPParam();
+			p.SysType=GetSysType(row["DATA_TYPE"].ToString());
+			p.DbType=GetDbType(row["DATA_TYPE"].ToString()).ToString();
+			p.Name=row["PARAMETER_NAME"].ToString().Replace("@","");
+			p.CleanName=CleanUp(p.Name);
+			result.Add(p);
+		}
+		
+		
+	}
+	return result;
+}
+List<SP> GetSPs(){
+    var result=new List<SP>();
+    //pull the SPs
+    
+    DataTable sprocs=null;
+    DataTable parameters=null;
+    
+    using(OracleConnection conn=new OracleConnection(ConnectionString)){
+        conn.Open();
+		sprocs=conn.GetSchema("Procedures");
+		conn.Close();
+	}
+	
+	foreach(DataRow row in sprocs.Rows){
+	    string spType=row["ROUTINE_TYPE"].ToString();
+        var sp=new SP();
+	    sp.Name=row["ROUTINE_NAME"].ToString();
+	    
+        if(spType=="PROCEDURE" &! sp.Name.StartsWith("sp_")){
+            
+    	    sp.CleanName=CleanUp(sp.Name);
+            
+            sp.Parameters=GetSPParams(sp.Name);
+            result.Add(sp);        
+        }
+    }
+    return result;
+    
+}
+   
+   
+List<Table> LoadTables(){
+    var result=new List<Table>();
+       
+    //pull the tables in a reader
+    using(IDataReader rdr=GetReader(TABLE_SQL)){
+        while(rdr.Read()){
+            Table tbl=new Table();
+            tbl.Name=rdr["TABLE_NAME"].ToString();
+            tbl.Schema=rdr["TABLE_SCHEMA"].ToString();
+            tbl.Columns=LoadColumns(tbl);
+            tbl.PrimaryKey=GetPK(tbl.Name);
+            tbl.CleanName=CleanUp(tbl.Name);
+            tbl.ClassName=Inflector.MakeSingular(tbl.CleanName);
+            tbl.QueryableName=Inflector.MakePlural(tbl.ClassName);
+            
+            //set the PK for the columns
+            var pkColumn=tbl.Columns.SingleOrDefault(x=>x.Name.ToLower().Trim()==tbl.PrimaryKey.ToLower().Trim());
+            if(pkColumn!=null)
+                pkColumn.IsPK=true;
+            
+            tbl.FKTables=LoadFKTables(tbl.Name);
+            
+            result.Add(tbl);
+        }
+    }
+    
+    foreach(Table tbl in result){
+        //loop the FK tables and see if there's a match for our FK columns
+        foreach(Column col in tbl.Columns){
+            col.IsForeignKey=tbl.FKTables.Any(
+                x=>x.ThisColumn.Equals(col.Name,StringComparison.InvariantCultureIgnoreCase)
+            );
+        }
+    }
+    return result;
+}
+
+List<Column> LoadColumns(Table tbl){
+    var result=new List<Column>();
+    var cmd=GetCommand(COLUMN_SQL);
+    cmd.Parameters.Add("tableName",tbl.Name);
+
+    using(IDataReader rdr=cmd.ExecuteReader(CommandBehavior.CloseConnection)){
+        while(rdr.Read()){
+            Column col=new Column();
+            col.Name=rdr["ColumnName"].ToString();
+            col.CleanName=CleanUp(col.Name);
+            col.DataType=rdr["DataType"].ToString();
+            col.SysType=GetSysType(col.DataType);
+            col.DbType=GetDbType(col.DataType);
+			//col.Name = col.DataType.ToString();
+            col.AutoIncrement=rdr["IsIdentity"].ToString()=="1";
+            col.IsNullable=rdr["IsNullable"].ToString()=="Y";
+            int.TryParse(rdr["MaxLength"].ToString(),out col.MaxLength);
+            
+            result.Add(col);
+        }
+
+    }
+    
+    return result;
+}
+
+List<FKTable> LoadFKTables(string tableName){
+    
+    //this is a "bi-directional" scheme
+    //which pulls both 1-many and many-1
+
+    var result=new List<FKTable>();
+    var cmd=GetCommand(FKSql);
+    cmd.Parameters.Add("tableName",tableName);
+    using(IDataReader rdr=cmd.ExecuteReader(CommandBehavior.CloseConnection)){
+        while(rdr.Read()){
+            FKTable fk=new FKTable();
+            string thisTable=rdr["ThisTable"].ToString();
+            
+            if(tableName.ToLower()==thisTable.ToLower()){
+                fk.ThisTable=rdr["ThisTable"].ToString();
+                fk.ThisColumn=rdr["ThisColumn"].ToString();
+                fk.OtherTable=rdr["OtherTable"].ToString();
+                fk.OtherColumn=rdr["OtherColumn"].ToString();
+            
+            }else{
+                fk.ThisTable=rdr["OtherTable"].ToString();
+                fk.ThisColumn=rdr["OtherColumn"].ToString();
+                fk.OtherTable=rdr["ThisTable"].ToString();
+                fk.OtherColumn=rdr["ThisColumn"].ToString();
+          
+            }
+            
+            fk.OtherClass=Inflector.MakeSingular(CleanUp(fk.OtherTable));
+            fk.OtherQueryable=Inflector.MakePlural(fk.OtherClass);
+            
+            result.Add(fk);
+        }
+    }
+    return result;
+
+}
+
+string GetPK(string table){
+	
+	string pk="";
+	DataTable pkTable=new DataTable();
+    string sql=@"SELECT column_name FROM ALL_CONS_COLUMNS A JOIN ALL_CONSTRAINTS C  ON A.CONSTRAINT_NAME = C.CONSTRAINT_NAME WHERE C.TABLE_NAME = :tableName AND C.CONSTRAINT_TYPE = 'P'";
+        
+    var cmd=GetCommand(sql);
+    cmd.Parameters.Add("tableName",table);
+	string result = null;
+	using(IDataReader rdr=cmd.ExecuteReader(CommandBehavior.CloseConnection)){
+        while(rdr.Read()){
+			result = rdr["column_name"].ToString();
+		}
+	}
+    cmd.Dispose();
+    if(result!=null)
+        pk=result.ToString();    
+         
+	return pk;
+}
+
+string GetSysType(string sqlType){
+	string sysType="string";
+	switch (sqlType) {
+
+        case "NUMBER":
+		case "PLS_INTEGER":
+		case "FLOAT":
+            sysType = "decimal";
+			break;
+        case "DATE":
+            sysType = "DateTime";
+			break;
+		case "BLOB":
+		case "CLOB":
+		case "NLOB":
+		case "BFILE":
+        case "TIMESTAMP":
+            sysType=  "byte[]";
+			 break;
+	}
+	return sysType;
+}
+DbType GetDbType(string sqlType){
+	switch(sqlType)
+    {
+        case "VARCHAR2":
+		case "NVARCHAR2":
+		case "VARCHAR":
+		case "LONG":
+            return DbType.String;
+        case "NUMBER":
+		case "PLS_INTEGER":
+		case "FLOAT":
+            return DbType.Decimal;
+        case "DATE":
+            return DbType.DateTime;
+		case "BLOB":
+		case "CLOB":
+		case "NLOB":
+		case "BFILE":
+        case "TIMESTAMP":
+            return DbType.Binary;
+       default:
+            return DbType.AnsiString;
+    }
+
+}
+
+#>
