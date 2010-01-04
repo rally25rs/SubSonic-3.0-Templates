@@ -1,7 +1,31 @@
 ﻿<#@ include file="Settings.ttinclude" #>
+<#@ assembly name="Oracle.DataAccess" #>
 <#@ import namespace="Oracle.DataAccess.Client" #>
 <#@ import namespace="Oracle.DataAccess.Types" #>
 <#+
+
+/* ***
+ * Begin Oracle specific settings.
+ * Set these values as needed, or move them to Settings.ttinclude
+ * *** */
+
+    // comma-separated list of owners whose mappings should be generated (case sensitive, used in an IN(...) statement).
+    const string SCHEMA_OWNER = "'NORTHWIND', 'SOUTHWIND'"; 
+	
+    // A seperator to use between the schema owner and table names.
+    // null = do not include schema name in class names. "" = no seperator.
+    // For example, if set to "_", then the class name for table T1 owned by O1 would be "class O1_T1 { ... }"
+    // This is useful when generating classes for multiple owner accounts that could have tables with the same name.
+    const string SCHEMA_OWNER_SEPARATOR = null;
+
+    // Whether or not to load all Foreign Key relations between tables.
+    // Loading the FK's for a large number of tables takes considerable time, and could be disabled here.
+    const bool LOAD_FKS = true;
+
+/* ***
+ * End of Oracle specific settings
+ * *** */
+
 IDataReader GetReader(string sql){
     OracleConnection conn=new OracleConnection(ConnectionString);
     OracleCommand cmd=new OracleCommand(sql,conn);
@@ -15,21 +39,13 @@ OracleCommand GetCommand(string sql){
     return cmd;
 }
 
-string FKSql = @"SELECT
-		cons.table_name as ThisTable,
-		cols2.column_name as ThisColumn,
-		cols.table_name as OtherTable,
-		cols.column_name as OtherColumn,
-		cons.CONSTRAINT_NAME as Constraint_Name,
-		cons.OWNER as Owner,
-		cons.R_CONSTRAINT_NAME as OtherConstraint,
-		cons.CONSTRAINT_TYPE as ConstraintType
-	FROM all_constraints cons
-	INNER JOIN ALL_CONS_COLUMNS cols ON cons.R_CONSTRAINT_NAME = cols.CONSTRAINT_NAME
-	INNER JOIN all_cons_columns cols2 ON cons.table_name = cols2.table_name AND (cols2.constraint_name = cons.constraint_name)
-	WHERE cols.owner = '" + SCHEMA_OWNER + @"' AND cols2.position IS NOT NULL
-	AND cons.table_name = '{0}' OR cols.table_name= '{0}'
-	ORDER BY 1, 2"; //tableName
+string FKSql = @"select cons.constraint_name as ThisConstraint, cons.r_constraint_name as OtherConstraint,
+  cols.owner, cols.table_name, cols.column_name
+from all_constraints cons
+inner join all_cons_columns cols on cols.constraint_name = cons.constraint_name or cols.constraint_name = cons.r_constraint_name
+where cons.r_constraint_name in (select constraint_name from all_constraints where table_name = '{0}' and constraint_type in ('P', 'U'))
+ or cons.table_name = '{0}' and cons.constraint_type = 'R'
+order by 1, 2";
 
 const string TABLE_SQL=@"SELECT
 		usr.TABLESPACE_NAME as TABLE_CATALOG,
@@ -40,8 +56,8 @@ const string TABLE_SQL=@"SELECT
          ALL_CATALOG cat 
     where usr.TABLE_NAME = cat.TABLE_NAME
 	and cat.table_type = 'TABLE'
-	and cat.owner = '" + SCHEMA_OWNER + @"'
-	ORDER BY usr.TABLE_NAME"; //and usr.TABLE_NAME = 'TBL_ORDERS'
+	and cat.owner IN (" + SCHEMA_OWNER + @")
+	ORDER BY usr.TABLE_NAME";
 
 const string COLUMN_SQL=@"SELECT
 		usr.tablespace_name as Database,
@@ -60,20 +76,21 @@ const string COLUMN_SQL=@"SELECT
 		0 as IsComputed FROM ALL_TAB_COLUMNS tab
 	INNER JOIN all_tables usr ON tab.TABLE_NAME = usr.TABLE_NAME
 	LEFT OUTER JOIN all_cons_columns cols ON (usr.TABLE_NAME = cols.TABLE_NAME AND tab.COLUMN_NAME = cols.COLUMN_NAME AND cols.constraint_name LIKE 'PK_%')
-	WHERE tab.owner = '" + SCHEMA_OWNER + @"'
+	WHERE tab.owner IN (" + SCHEMA_OWNER + @")
 	AND tab.table_name = :tableName
 	ORDER BY TableName, OrdinalPosition ASC";
   
-  string SPparams = @"SELECT * FROM ALL_ARGUMENTS WHERE OWNER = '{0}' AND OBJECT_NAME = '{1}' ORDER BY position";
+  string SPparams = @"SELECT * FROM ALL_ARGUMENTS WHERE OBJECT_ID = {0} AND SUBPROGRAM_ID = {1} AND ARGUMENT_NAME IS NOT NULL ORDER BY POSITION";
   
-  const string SP_SQL = "SELECT * FROM USER_PROCEDURES WHERE OBJECT_TYPE = 'PROCEDURE'";
+  const string SP_SQL = "SELECT OWNER, OBJECT_NAME, PROCEDURE_NAME, OBJECT_TYPE, OBJECT_ID, SUBPROGRAM_ID FROM ALL_PROCEDURES WHERE OWNER IN ({0}) AND OBJECT_TYPE IN ('FUNCTION', 'PACKAGE', 'PROCEDURE')";
   
 
   
-List<SPParam> GetSPParams(string spName)
+List<SPParam> GetSPParams(string objectId, string subprogramId)
 {
     var result=new List<SPParam>();
-    string sql = string.Format(SPparams, TableSpaceName, spName);
+    string sql = string.Format(SPparams, objectId, subprogramId);
+
     int? dataprecision; int? datascale;
     
     //pull the tables in a reader
@@ -117,41 +134,33 @@ List<SPParam> GetSPParams(string spName)
 	return result;
 }
 
-//    List<SPParam> GetSPParams(string spName){
-//    var result=new List<SPParam>();
-//    string[] restrictions = new string[4] { DatabaseName, null, spName, null };
-//    using(OracleConnection conn=new OracleConnection(ConnectionString)){
-//        conn.Open();
-//        var sprocs=conn.GetSchema("ProcedureParameters", restrictions);
-//        conn.Close();
-//        foreach(DataRow row in sprocs.Select("", "ORDINAL_POSITION")){
-//            SPParam p=new SPParam();
-//            p.SysType=GetSysType(row["DATA_TYPE"].ToString());
-//            p.DbType=GetDbType(row["DATA_TYPE"].ToString()).ToString();
-//            p.Name=row["PARAMETER_NAME"].ToString().Replace("@","");
-//            p.CleanName=CleanUp(p.Name);
-//            result.Add(p);
-//        }	
-//    }
-//    return result;
-//}
-
 List<SP> GetSPs()
 {
     var result=new List<SP>();
     //pull the sprocs in a reader
-    using(IDataReader rdr=GetReader(SP_SQL))
+    using(IDataReader rdr=GetReader(string.Format(SP_SQL, SCHEMA_OWNER)))
     {
         while(rdr.Read())
         {
 			var sp=new SP();
-			sp.Name=rdr["OBJECT_NAME"].ToString();
-			if(!string.IsNullOrEmpty(sp.Name))
-				{
+			var ownerName = rdr["OWNER"].ToString();
+			var objName = rdr["OBJECT_NAME"].ToString();
+			var procName = rdr["PROCEDURE_NAME"].ToString();
+			var objType = rdr["OBJECT_TYPE"].ToString();
+			var objectId = rdr["OBJECT_ID"].ToString();
+			var subprogramId = rdr["SUBPROGRAM_ID"].ToString();
+			//sp.SchemaName = ownerName;
+			sp.Name = objName;
+			if(objType == "PACKAGE")
+			{
+				sp.Name += "." + procName;
+			}
+			if(SCHEMA_OWNER_SEPARATOR == null)
 				sp.CleanName=CleanUp(sp.Name);
-				sp.Parameters=GetSPParams(sp.Name);
-				result.Add(sp);
-				}
+			else
+				sp.CleanName=CleanUp(ownerName + SCHEMA_OWNER_SEPARATOR + sp.Name);
+			sp.Parameters=GetSPParams(objectId, subprogramId);
+			result.Add(sp);
         }
     }
     return result;
@@ -173,6 +182,11 @@ List<Table> LoadTables(){
             tbl.CleanName=CleanUp(tbl.Name);
             tbl.ClassName=Inflector.MakeSingular(tbl.CleanName);
             tbl.QueryableName=Inflector.MakePlural(tbl.ClassName);
+            if(SCHEMA_OWNER_SEPARATOR != null)
+            {
+				tbl.QueryableName = tbl.Schema + SCHEMA_OWNER_SEPARATOR + tbl.QueryableName;
+				tbl.ClassName = tbl.Schema + SCHEMA_OWNER_SEPARATOR + tbl.ClassName;
+			}
             
             //set the PK for the columns
             var pkColumn=tbl.Columns.SingleOrDefault(x=>x.Name.ToLower().Trim()==tbl.PrimaryKey.ToLower().Trim());
@@ -223,53 +237,59 @@ List<Column> LoadColumns(Table tbl){
      return result;
 }
 
-//    List<Column> LoadColumns(Table tbl){
-//    var result=new List<Column>();
-//    var cmd=GetCommand(COLUMN_SQL);
-//    cmd.Parameters.AddWithValue("tableName",tbl.Name);
-
-//    using(IDataReader rdr=cmd.ExecuteReader(CommandBehavior.CloseConnection)){
-//        while(rdr.Read()){
-//            Column col=new Column();
-//            col.Name=rdr["ColumnName"].ToString();
-//            col.CleanName=CleanUp(col.Name);
-//            col.DataType=rdr["DataType"].ToString();
-//            col.SysType=GetSysType(col.DataType);
-//            col.DbType=GetDbType(col.DataType);
-//            //col.Name = col.DataType.ToString();
-//            col.AutoIncrement=rdr["IsIdentity"].ToString()=="1";
-//            col.IsNullable=rdr["IsNullable"].ToString()=="Y";
-//            int.TryParse(rdr["MaxLength"].ToString(),out col.MaxLength);
-//            result.Add(col);
-//        }
-//    }
-//    return result;
-//}
-
 
 List<FKTable> LoadFKTables(string tableName)
 {
     //this is a "bi-directional" scheme which pulls both 1-many and many-1
     var result=new List<FKTable>();
+    if(!LOAD_FKS)
+		return result;
     string sql = string.Format(FKSql, tableName);
     var cmd=GetCommand(sql);
 	cmd.Parameters.Add("tableName",tableName);
     using(IDataReader rdr=cmd.ExecuteReader(CommandBehavior.CloseConnection)){
         while(rdr.Read()){
             FKTable fk=new FKTable();
-            string thisTable=rdr["ThisTable"].ToString();
+            string thisConstraint = rdr["ThisConstraint"].ToString();
+            string otherConstraint = rdr["OtherConstraint"].ToString();
+            string thisOwner=rdr["owner"].ToString();
+            string thisTable=rdr["table_name"].ToString();
+            string thisColumn=rdr["column_name"].ToString();
+            rdr.Read();
+            string thisConstraint2 = rdr["ThisConstraint"].ToString();
+            string otherConstraint2 = rdr["OtherConstraint"].ToString();
+            string otherOwner=rdr["owner"].ToString();
+            string otherTable=rdr["table_name"].ToString();
+            string otherColumn=rdr["column_name"].ToString();
+
+            if(thisConstraint != thisConstraint2)
+				throw new Exception(string.Format("FK lookup missmatch. Expecting {0}, but found {1}", thisConstraint, thisConstraint2));
+            if(otherConstraint != otherConstraint2)
+				throw new Exception(string.Format("FK lookup missmatch. Expecting {0}, but found {1}", otherConstraint, otherConstraint2));
             
             if(tableName.ToLower()==thisTable.ToLower())
             {
-                fk.ThisTable=rdr["ThisTable"].ToString();
-                fk.ThisColumn=rdr["ThisColumn"].ToString();
-                fk.OtherTable=rdr["OtherTable"].ToString();
-                fk.OtherColumn=rdr["OtherColumn"].ToString();
+				if(SCHEMA_OWNER_SEPARATOR != null)
+					fk.ThisTable=thisOwner + SCHEMA_OWNER_SEPARATOR + thisTable;
+				else
+					fk.ThisTable=thisTable;
+                fk.ThisColumn=thisColumn;
+				if(SCHEMA_OWNER_SEPARATOR != null)
+					fk.OtherTable=otherOwner + SCHEMA_OWNER_SEPARATOR + otherTable;
+				else
+					fk.OtherTable=otherTable;
+                fk.OtherColumn=otherColumn;
             }else{
-                fk.ThisTable=rdr["OtherTable"].ToString();
-                fk.ThisColumn=rdr["OtherColumn"].ToString();
-                fk.OtherTable=rdr["ThisTable"].ToString();
-                fk.OtherColumn=rdr["ThisColumn"].ToString();
+ 				if(SCHEMA_OWNER_SEPARATOR != null)
+					fk.ThisTable=otherOwner + SCHEMA_OWNER_SEPARATOR + otherTable;
+				else
+					fk.ThisTable=otherTable;
+                fk.ThisColumn=otherColumn;
+				if(SCHEMA_OWNER_SEPARATOR != null)
+					fk.OtherTable=thisOwner + SCHEMA_OWNER_SEPARATOR + thisTable;
+				else
+					fk.OtherTable=thisTable;
+                fk.OtherColumn=thisColumn;
             }
             fk.OtherClass=Inflector.MakeSingular(CleanUp(fk.OtherTable));
             fk.OtherQueryable=Inflector.MakePlural(fk.OtherClass);
@@ -337,23 +357,19 @@ string GetPK(string table)
                 sysType = "decimal";
                 break;
             case "NUMBER":
-                if ((!sqlDataPrecision.HasValue && !sqlDataScale.HasValue) || (sqlDataScale.HasValue && sqlDataScale.Value > 0))
-                    sysType = "decimal";
-                else
-					if (!sqlDataScale.HasValue || sqlDataScale.Value < 1)
-					{
-						sysType = "int"; //between 4 and 18
-						if(!sqlDataPrecision.HasValue)
-							sysType = "short";
-						else
-						{
-							if (sqlDataPrecision.Value < 4)
-								sysType = "short";
-							else
-							if (sqlDataPrecision.Value > 18)
-								sysType = "long";
-						}
-					}
+				sysType = "decimal";
+        		if(sqlDataScale == -1 || sqlDataPrecision == -1)
+					sysType = "decimal";
+				else if ((sqlDataScale <= 0) && ((sqlDataPrecision - sqlDataScale) < 5))
+					sysType = "short";
+				else if ((sqlDataScale <= 0) && ((sqlDataPrecision - sqlDataScale) < 10))
+					sysType = "int";
+				else if ((sqlDataScale <= 0) && ((sqlDataPrecision - sqlDataScale) < 19))
+					sysType = "long";
+				else if ((sqlDataPrecision < 8) && (((sqlDataScale <= 0) && ((sqlDataPrecision - sqlDataScale) <= 38)) || ((sqlDataScale > 0) && (sqlDataScale <= 44))))
+					sysType = "float";
+				else if (sqlDataPrecision < 16)
+					sysType = "double";
                 break;
             case "REAL":
             case "NUMERIC":
@@ -445,6 +461,7 @@ string GetPK(string table)
                 DbType = System.Data.DbType.String;
                 break;
             case "NUMBER":
+                DbType = System.Data.DbType.Decimal;
                 if ((!sqlDataPrecision.HasValue && !sqlDataScale.HasValue) || (sqlDataScale.HasValue && sqlDataScale.Value > 0))
                     DbType = System.Data.DbType.Decimal;
                 else
