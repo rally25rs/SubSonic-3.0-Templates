@@ -55,6 +55,7 @@ const string TABLE_SQL=@"SELECT
 	FROM all_tables usr,
          ALL_CATALOG cat 
     where usr.TABLE_NAME = cat.TABLE_NAME
+    and cat.owner = usr.owner
 	and cat.table_type = 'TABLE'
 	and cat.owner IN (" + SCHEMA_OWNER + @")
 	ORDER BY usr.TABLE_NAME";
@@ -74,8 +75,8 @@ const string COLUMN_SQL=@"SELECT
 		tab.data_length as DatePrecision,
 		(CASE WHEN cols.CONSTRAINT_NAME IS NULL THEN 0 ELSE 1 END) as IsIdentity,
 		0 as IsComputed FROM ALL_TAB_COLUMNS tab
-	INNER JOIN all_tables usr ON tab.TABLE_NAME = usr.TABLE_NAME
-	LEFT OUTER JOIN all_cons_columns cols ON (usr.TABLE_NAME = cols.TABLE_NAME AND tab.COLUMN_NAME = cols.COLUMN_NAME AND cols.constraint_name LIKE 'PK_%')
+	INNER JOIN all_tables usr ON tab.TABLE_NAME = usr.TABLE_NAME and tab.OWNER = usr.OWNER
+	LEFT OUTER JOIN all_cons_columns cols ON (usr.TABLE_NAME = cols.TABLE_NAME AND tab.COLUMN_NAME = cols.COLUMN_NAME AND cols.constraint_name LIKE 'PK_%' and tab.OWNER = cols.OWNER)
 	WHERE tab.owner IN (" + SCHEMA_OWNER + @")
 	AND tab.table_name = :tableName
 	ORDER BY TableName, OrdinalPosition ASC";

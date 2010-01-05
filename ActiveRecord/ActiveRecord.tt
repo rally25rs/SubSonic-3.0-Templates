@@ -1,3 +1,5 @@
+<#@ template language="C#v3.5" debug="False" hostspecific="True"  #>
+<#@ output extension=".cs" #>
 <#@ include file="MySQL.ttinclude" #>
 using System;
 using System.Collections.Generic;
@@ -284,8 +286,12 @@ namespace <#=Namespace #>
         public override int GetHashCode() {
             return this.<#=tbl.PK.CleanName #>;
         }
-        
+<#      } else {#>
+        public override int GetHashCode() {
+            return this.<#=tbl.PK.CleanName #>.ToString().GetHashCode();
+        }
 <#      }#>
+
         public string DescriptorValue()
         {
             <# if (tbl.ClassName == tbl.Descriptor.CleanName){ #>
