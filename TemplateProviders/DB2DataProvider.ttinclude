@@ -454,7 +454,7 @@ List<FKTable> LoadFKTables(string schemaName, string tableName)
     System.Data.DbType GetDbType(string sqlType, int? sqlDataPrecision, int? sqlDataScale)
     {
 		System.Data.DbType DbType = System.Data.DbType.AnsiString; //Default
-        switch (sqlType)
+        switch (sqlType.ToUpper())
         {
             case "VARCHAR2":
             case "VARCHAR":
