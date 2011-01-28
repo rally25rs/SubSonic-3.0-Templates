@@ -155,7 +155,8 @@ const string SPParams = @"SELECT
         r.ROUTINETYPE = 'P'
         WHERE
         NOT p.ROWTYPE IN ('R', 'C')
-        AND r.ROUTINEID = @procName";
+        AND r.ROUTINEID = @procName
+		ORDER BY p.ORDINAL";
   
 List<SPParam> GetSPParams(string procId)
 {
